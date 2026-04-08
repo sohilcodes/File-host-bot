@@ -1,6 +1,7 @@
 import os, telebot, subprocess, json, re, requests, time, random
 from flask import Flask, request, jsonify
 from threading import Thread
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # ===== ENV =====
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -25,20 +26,18 @@ def save():
     json.dump(data, open(DATA_FILE, "w"))
 
 processes = {}
-running_tokens = {}
-
 otp_store = {}
 sessions = {}
 
-# ===== TOKEN SYSTEM =====
+# ===== TOKEN =====
 def extract_token(path):
-    content = open(path).read()
+    code = open(path).read()
     patterns = [
         r'BOT_TOKEN\s*=\s*["\'](.+?)["\']',
         r'TOKEN\s*=\s*["\'](.+?)["\']'
     ]
     for p in patterns:
-        m = re.search(p, content)
+        m = re.search(p, code)
         if m:
             return m.group(1)
     return None
@@ -72,11 +71,11 @@ def send_otp():
     otp_store[uid] = (otp, time.time())
 
     try:
-        bot.send_message(int(uid), f"🔐 OTP: {otp}")
+        bot.send_message(int(uid), f"🔐 Your OTP: {otp}")
     except:
-        return "Start bot first"
+        return "START_BOT_FIRST"
 
-    return "sent"
+    return "SENT"
 
 @app.route("/verify_otp", methods=["POST"])
 def verify():
@@ -85,37 +84,101 @@ def verify():
 
     if uid in otp_store:
         real, t = otp_store[uid]
+
         if time.time() - t < 120 and otp == real:
             sessions[uid] = True
+
+            try:
+                bot.send_message(int(uid), "✅ Login Successful on Dashboard")
+            except:
+                pass
+
+            del otp_store[uid]
             return "SUCCESS"
+
     return "FAIL"
 
+# ===== LOGIN UI =====
 @app.route("/login")
 def login():
-    return '''
-    <form action="/send_otp" method="post">
-    <input name="user_id" placeholder="Telegram ID">
-    <button>Send OTP</button>
-    </form><br>
-    <form action="/verify_otp" method="post">
-    <input name="user_id"><input name="otp">
-    <button>Verify</button>
-    </form>
-    '''
+    return """
+<!DOCTYPE html>
+<html>
+<head>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Login</title>
+<style>
+body{background:#0f172a;color:white;font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;}
+.box{background:#1e293b;padding:25px;border-radius:15px;width:90%;max-width:350px;text-align:center;}
+input{width:90%;padding:12px;margin:10px 0;border:none;border-radius:8px;}
+button{width:95%;padding:12px;background:#22c55e;border:none;border-radius:8px;color:white;font-weight:bold;}
+#otpBox{display:none;}
+</style>
+</head>
+<body>
+<div class="box">
+<h2>🔐 Login</h2>
 
+<input id="uid" placeholder="Telegram User ID">
+<button onclick="sendOTP()">Send OTP</button>
+
+<div id="otpBox">
+<input id="otp" placeholder="Enter OTP">
+<button onclick="verifyOTP()">Verify</button>
+</div>
+
+<p id="msg"></p>
+
+</div>
+
+<script>
+function sendOTP(){
+let uid=document.getElementById("uid").value;
+
+fetch("/send_otp",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:"user_id="+uid})
+.then(res=>res.text())
+.then(d=>{
+document.getElementById("msg").innerText="OTP Sent";
+document.getElementById("otpBox").style.display="block";
+});
+}
+
+function verifyOTP(){
+let uid=document.getElementById("uid").value;
+let otp=document.getElementById("otp").value;
+
+fetch("/verify_otp",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:"user_id="+uid+"&otp="+otp})
+.then(res=>res.text())
+.then(d=>{
+if(d=="SUCCESS"){
+window.location="/dashboard?user_id="+uid;
+}else{
+document.getElementById("msg").innerText="Invalid OTP";
+}
+});
+}
+</script>
+
+</body>
+</html>
+"""
+
+# ===== DASHBOARD =====
 @app.route("/dashboard")
 def dash():
     uid = request.args.get("user_id")
+
     if uid not in sessions:
         return "Login Required"
 
     return f"""
+    <h2>Dashboard</h2>
     Users: {len(data['users'])}<br>
     Bots: {sum(len(v) for v in data['users'].values())}<br>
     Running: {len(processes)}
     """
 
-# ===== TRACK API =====
+# ===== TRACK USERS =====
 @app.route("/add_user", methods=["POST"])
 def add_user():
     uid = int(request.form.get("user_id"))
@@ -128,7 +191,7 @@ def add_user():
 
     return jsonify({"ok": True})
 
-# ===== START =====
+# ===== TELEGRAM BOT =====
 @bot.message_handler(commands=['start'])
 def start(msg):
     uid = str(msg.from_user.id)
@@ -136,7 +199,7 @@ def start(msg):
     save()
 
     bot.send_message(msg.chat.id,
-        "👋 Welcome\n\nUpload .py\n/run file.py\n\n💰 Premium → @SohilCodes"
+        "👋 Welcome\nUpload .py file\n/run file.py\n\n💰 Premium → @SohilCodes"
     )
 
 # ===== UPLOAD =====
@@ -146,13 +209,13 @@ def upload(msg):
     file = msg.document
 
     if not file.file_name.endswith(".py"):
-        return bot.reply_to(msg, "❌ Only .py")
+        return bot.reply_to(msg, "Only .py allowed")
 
     if uid not in data["premium"] and len(data["users"][uid]) >= 1:
-        return bot.reply_to(msg, "💰 Upgrade @SohilCodes")
+        return bot.reply_to(msg, "Upgrade → @SohilCodes")
 
-    info = bot.get_file(file.file_id)
-    data_bytes = bot.download_file(info.file_path)
+    f = bot.get_file(file.file_id)
+    data_bytes = bot.download_file(f.file_path)
 
     path = os.path.join(UPLOAD_FOLDER, file.file_name)
     open(path, "wb").write(data_bytes)
@@ -160,7 +223,7 @@ def upload(msg):
     data["users"][uid].append(file.file_name)
     save()
 
-    bot.reply_to(msg, f"✅ Uploaded\n/run {file.file_name}")
+    bot.reply_to(msg, f"Uploaded\n/run {file.file_name}")
 
 # ===== RUN =====
 @bot.message_handler(commands=['run'])
@@ -170,18 +233,18 @@ def run(msg):
     path = os.path.join(UPLOAD_FOLDER, file)
 
     if not is_safe_code(path):
-        return bot.reply_to(msg, "❌ Unsafe code")
+        return bot.reply_to(msg, "Unsafe code")
 
     token = extract_token(path)
     if not token or not valid_token(token):
-        return bot.reply_to(msg, "❌ Invalid token")
+        return bot.reply_to(msg, "Invalid token")
 
     remove_webhook(token)
 
     p = subprocess.Popen(["python3", path])
     processes[uid] = p
 
-    bot.reply_to(msg, "🚀 Started")
+    bot.reply_to(msg, "Started")
 
 # ===== STOP =====
 @bot.message_handler(commands=['stop'])
@@ -190,46 +253,18 @@ def stop(msg):
     if uid in processes:
         processes[uid].kill()
         del processes[uid]
-        bot.reply_to(msg, "🛑 Stopped")
+        bot.reply_to(msg, "Stopped")
 
-# ===== BROADCAST =====
-@bot.message_handler(commands=['broadcast'])
-def bc(msg):
-    if msg.from_user.id != ADMIN_ID:
-        return
-
-    text = msg.text.replace("/broadcast ", "")
-    for token, users in data["bot_users"].items():
-        for u in users:
-            try:
-                requests.get(
-                    f"https://api.telegram.org/bot{token}/sendMessage",
-                    params={"chat_id": u, "text": text}
-                )
-            except:
-                pass
-
-    bot.reply_to(msg, "✅ Sent")
-
-# ===== ADMIN PANEL BUTTONS =====
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
-
+# ===== ADMIN PANEL =====
 @bot.message_handler(commands=['admin'])
 def admin(msg):
     if msg.from_user.id != ADMIN_ID:
         return
 
     kb = InlineKeyboardMarkup()
-    kb.add(
-        InlineKeyboardButton("👥 Users", callback_data="users"),
-        InlineKeyboardButton("💰 Premium", callback_data="premium")
-    )
-    kb.add(
-        InlineKeyboardButton("➕ Add Premium", callback_data="addp"),
-        InlineKeyboardButton("➖ Remove Premium", callback_data="remp")
-    )
-
-    bot.send_message(msg.chat.id, "👑 Admin Panel", reply_markup=kb)
+    kb.add(InlineKeyboardButton("Users", callback_data="users"))
+    kb.add(InlineKeyboardButton("Premium", callback_data="premium"))
+    bot.send_message(msg.chat.id, "Admin Panel", reply_markup=kb)
 
 @bot.callback_query_handler(func=lambda c: True)
 def cb(c):
@@ -237,40 +272,4 @@ def cb(c):
         return
 
     if c.data == "users":
-        bot.answer_callback_query(c.id, f"Users: {len(data['users'])}")
-
-    elif c.data == "premium":
-        bot.answer_callback_query(c.id, str(data["premium"]))
-
-    elif c.data == "addp":
-        bot.send_message(c.message.chat.id, "Send: /addpremium ID")
-
-    elif c.data == "remp":
-        bot.send_message(c.message.chat.id, "Send: /removepremium ID")
-
-@bot.message_handler(commands=['addpremium'])
-def addp(msg):
-    if msg.from_user.id != ADMIN_ID:
-        return
-    uid = msg.text.split()[1]
-    data["premium"].append(uid)
-    save()
-    bot.reply_to(msg, "✅ Added")
-
-@bot.message_handler(commands=['removepremium'])
-def remp(msg):
-    if msg.from_user.id != ADMIN_ID:
-        return
-    uid = msg.text.split()[1]
-    data["premium"].remove(uid)
-    save()
-    bot.reply_to(msg, "❌ Removed")
-
-# ===== RUN =====
-def run_flask():
-    app.run(host="0.0.0.0", port=5000)
-
-if __name__ == "__main__":
-    Thread(target=run_flask).start()
-    print("🚀 Running")
-    bot.infinity_polling()
+        bot.answer_callback_query(c.id
