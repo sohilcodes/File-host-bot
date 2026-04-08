@@ -1,7 +1,6 @@
 import os, telebot, subprocess, json, re, requests, time, random
 from flask import Flask, request, jsonify
 from threading import Thread
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # ===== ENV =====
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -26,6 +25,8 @@ def save():
     json.dump(data, open(DATA_FILE, "w"))
 
 processes = {}
+logs = {}
+
 otp_store = {}
 sessions = {}
 
@@ -60,6 +61,45 @@ def is_safe_code(path):
     code = open(path).read()
     return not any(b in code for b in bad)
 
+# ===== ERROR MONITOR =====
+def monitor(uid, process, log_file):
+    process.wait()
+
+    try:
+        with open(log_file) as f:
+            content = f.read()
+    except:
+        content = "No logs"
+
+    if "Traceback" in content or "Error" in content:
+        msg = "❌ Bot Crashed!\n\nLast Logs:\n" + content[-1000:]
+
+        try:
+            bot.send_message(int(uid), msg)
+        except:
+            pass
+
+        try:
+            bot.send_message(ADMIN_ID, f"🚨 User {uid} bot crashed\n\n{content[-1000:]}")
+        except:
+            pass
+
+# ===== RUN BOT =====
+def run_bot(uid, path):
+    log_file = f"logs_{uid}.txt"
+
+    with open(log_file, "w") as f:
+        p = subprocess.Popen(
+            ["python3", path],
+            stdout=f,
+            stderr=f
+        )
+
+    processes[uid] = p
+    logs[uid] = log_file
+
+    Thread(target=monitor, args=(uid, p, log_file)).start()
+
 # ===== OTP =====
 def generate_otp():
     return str(random.randint(100000, 999999))
@@ -89,7 +129,7 @@ def verify():
             sessions[uid] = True
 
             try:
-                bot.send_message(int(uid), "✅ Login Successful on Dashboard")
+                bot.send_message(int(uid), "✅ Login Successful")
             except:
                 pass
 
@@ -102,96 +142,61 @@ def verify():
 @app.route("/login")
 def login():
     return """
-<!DOCTYPE html>
-<html>
-<head>
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Login</title>
-<style>
-body{background:#0f172a;color:white;font-family:sans-serif;display:flex;justify-content:center;align-items:center;height:100vh;}
-.box{background:#1e293b;padding:25px;border-radius:15px;width:90%;max-width:350px;text-align:center;}
-input{width:90%;padding:12px;margin:10px 0;border:none;border-radius:8px;}
-button{width:95%;padding:12px;background:#22c55e;border:none;border-radius:8px;color:white;font-weight:bold;}
-#otpBox{display:none;}
-</style>
-</head>
-<body>
-<div class="box">
-<h2>🔐 Login</h2>
+    <html>
+    <body style="background:#0f172a;color:white;text-align:center;">
+    <h2>🔐 Login</h2>
 
-<input id="uid" placeholder="Telegram User ID">
-<button onclick="sendOTP()">Send OTP</button>
+    <input id="uid" placeholder="Telegram ID"><br><br>
+    <button onclick="sendOTP()">Send OTP</button><br><br>
 
-<div id="otpBox">
-<input id="otp" placeholder="Enter OTP">
-<button onclick="verifyOTP()">Verify</button>
-</div>
+    <div id="otpBox" style="display:none;">
+        <input id="otp" placeholder="OTP"><br><br>
+        <button onclick="verifyOTP()">Verify</button>
+    </div>
 
-<p id="msg"></p>
+    <p id="msg"></p>
 
-</div>
+    <script>
+    function sendOTP(){
+        let uid=document.getElementById("uid").value;
 
-<script>
-function sendOTP(){
-let uid=document.getElementById("uid").value;
+        fetch("/send_otp",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:"user_id="+uid})
+        .then(()=>{document.getElementById("otpBox").style.display="block";});
+    }
 
-fetch("/send_otp",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:"user_id="+uid})
-.then(res=>res.text())
-.then(d=>{
-document.getElementById("msg").innerText="OTP Sent";
-document.getElementById("otpBox").style.display="block";
-});
-}
+    function verifyOTP(){
+        let uid=document.getElementById("uid").value;
+        let otp=document.getElementById("otp").value;
 
-function verifyOTP(){
-let uid=document.getElementById("uid").value;
-let otp=document.getElementById("otp").value;
-
-fetch("/verify_otp",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:"user_id="+uid+"&otp="+otp})
-.then(res=>res.text())
-.then(d=>{
-if(d=="SUCCESS"){
-window.location="/dashboard?user_id="+uid;
-}else{
-document.getElementById("msg").innerText="Invalid OTP";
-}
-});
-}
-</script>
-
-</body>
-</html>
-"""
+        fetch("/verify_otp",{method:"POST",headers:{"Content-Type":"application/x-www-form-urlencoded"},body:"user_id="+uid+"&otp="+otp})
+        .then(res=>res.text())
+        .then(d=>{
+            if(d=="SUCCESS"){
+                window.location="/dashboard?user_id="+uid;
+            }else{
+                document.getElementById("msg").innerText="Invalid OTP";
+            }
+        });
+    }
+    </script>
+    </body>
+    </html>
+    """
 
 # ===== DASHBOARD =====
 @app.route("/dashboard")
 def dash():
     uid = request.args.get("user_id")
-
     if uid not in sessions:
         return "Login Required"
 
     return f"""
-    <h2>Dashboard</h2>
     Users: {len(data['users'])}<br>
     Bots: {sum(len(v) for v in data['users'].values())}<br>
     Running: {len(processes)}
     """
 
-# ===== TRACK USERS =====
-@app.route("/add_user", methods=["POST"])
-def add_user():
-    uid = int(request.form.get("user_id"))
-    token = request.form.get("token")
-
-    data["bot_users"].setdefault(token, [])
-    if uid not in data["bot_users"][token]:
-        data["bot_users"][token].append(uid)
-        save()
-
-    return jsonify({"ok": True})
-
-# ===== TELEGRAM BOT =====
+# ===== BOT START =====
 @bot.message_handler(commands=['start'])
 def start(msg):
     uid = str(msg.from_user.id)
@@ -199,7 +204,7 @@ def start(msg):
     save()
 
     bot.send_message(msg.chat.id,
-        "👋 Welcome\nUpload .py file\n/run file.py\n\n💰 Premium → @SohilCodes"
+        "👋 Upload .py\n/run file.py\n/logs to view logs"
     )
 
 # ===== UPLOAD =====
@@ -209,10 +214,10 @@ def upload(msg):
     file = msg.document
 
     if not file.file_name.endswith(".py"):
-        return bot.reply_to(msg, "Only .py allowed")
+        return bot.reply_to(msg, "Only .py")
 
     if uid not in data["premium"] and len(data["users"][uid]) >= 1:
-        return bot.reply_to(msg, "Upgrade → @SohilCodes")
+        return bot.reply_to(msg, "Upgrade required")
 
     f = bot.get_file(file.file_id)
     data_bytes = bot.download_file(f.file_path)
@@ -240,36 +245,27 @@ def run(msg):
         return bot.reply_to(msg, "Invalid token")
 
     remove_webhook(token)
+    run_bot(uid, path)
 
-    p = subprocess.Popen(["python3", path])
-    processes[uid] = p
+    bot.reply_to(msg, "Started with monitoring")
 
-    bot.reply_to(msg, "Started")
-
-# ===== STOP =====
-@bot.message_handler(commands=['stop'])
-def stop(msg):
+# ===== LOGS =====
+@bot.message_handler(commands=['logs'])
+def logs_cmd(msg):
     uid = str(msg.from_user.id)
-    if uid in processes:
-        processes[uid].kill()
-        del processes[uid]
-        bot.reply_to(msg, "Stopped")
 
-# ===== ADMIN PANEL =====
-@bot.message_handler(commands=['admin'])
-def admin(msg):
-    if msg.from_user.id != ADMIN_ID:
-        return
+    if uid not in logs:
+        return bot.reply_to(msg, "No logs")
 
-    kb = InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("Users", callback_data="users"))
-    kb.add(InlineKeyboardButton("Premium", callback_data="premium"))
-    bot.send_message(msg.chat.id, "Admin Panel", reply_markup=kb)
+    with open(logs[uid]) as f:
+        content = f.read()[-4000:]
 
-@bot.callback_query_handler(func=lambda c: True)
-def cb(c):
-    if c.from_user.id != ADMIN_ID:
-        return
+    bot.reply_to(msg, content)
 
-    if c.data == "users":
-        bot.answer_callback_query(c.id
+# ===== RUN =====
+def run_flask():
+    app.run(host="0.0.0.0", port=5000)
+
+if __name__ == "__main__":
+    Thread(target=run_flask).start()
+    bot.infinity_polling()
